@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "splatflow"
+version = "0.1.0"
+description = "End-user friendly pipeline for creating 3D Gaussian Splats from smartphone photos/videos (Sharp Frames → COLMAP → LichtFeld)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Your Name" }]
+dependencies = [
+  "platformdirs>=4.2",
+  "requests>=2.31",
+  "sharp-frames>=0.3.1",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.6"]
+
+[project.scripts]
+splatflow = "splatflow.frontend.app:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
