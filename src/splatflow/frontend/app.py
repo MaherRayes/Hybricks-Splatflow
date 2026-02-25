@@ -3,6 +3,9 @@ from __future__ import annotations
 import sys
 from dataclasses import asdict
 from pathlib import Path
+import shutil
+import subprocess
+from fractions import Fraction
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -10,6 +13,7 @@ from splatflow.backend import PipelineConfig, SplatPipeline
 from splatflow.backend.paths import AppPaths
 from splatflow.backend.settings import Settings, SettingsStore, ToolPaths
 
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm"}
 
 def _forward_wheel_to_scrollarea(src: QtWidgets.QWidget, event: QtGui.QWheelEvent) -> None:
     # Find nearest parent scroll area (your options panel is inside one)
@@ -137,9 +141,11 @@ class MainWindow(QtWidgets.QMainWindow):
         input_layout.addRow("Type", self.input_type)
 
         self.input_path = QtWidgets.QLineEdit()
+        self.input_path.editingFinished.connect(self._apply_video_fps_from_input)
         browse_in = QtWidgets.QPushButton("Browse…")
         browse_in.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         browse_in.clicked.connect(self._browse_input)
+        browse_in.clicked.connect(self._apply_video_fps_from_input)
         in_row = QtWidgets.QHBoxLayout()
         in_row.addWidget(self.input_path, 1)
         in_row.addWidget(browse_in)
@@ -194,23 +200,59 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sf_enabled.setChecked(True)
         basic_layout.addRow("Frame sampling", self.sf_enabled)
 
-        self.sf_method = NoWheelComboBox()
-        self.sf_method.addItems(["best-n", "batched", "outlier-removal"])
-        basic_layout.addRow("Sampling method", self.sf_method)
-
-        self.sf_num_frames = NoWheelSpinBox()
-        self.sf_num_frames.setRange(1, 50000)
-        self.sf_num_frames.setValue(300)
-        basic_layout.addRow("Target frames/images", self.sf_num_frames)
-
         self.sf_fps = NoWheelSpinBox()
         self.sf_fps.setRange(1, 240)
         self.sf_fps.setValue(10)
         basic_layout.addRow("Video FPS sampling", self.sf_fps)
 
+        self.sf_method = NoWheelComboBox()
+        self.sf_method.addItems(["best-n", "batched"])
+        self.sf_method.setCurrentIndex(1)
+        basic_layout.addRow("Sampling method", self.sf_method)
+
+        self.sf_num_frames = NoWheelSpinBox()
+        self.sf_num_frames.setRange(1, 50000)
+        self.sf_num_frames.setValue(300)
+        basic_layout.addRow("best-n: num_frames", self.sf_num_frames)
+        self._sf_lbl_num_frames = basic_layout.labelForField(self.sf_num_frames)
+
+        self.sf_min_buffer = NoWheelSpinBox()
+        self.sf_min_buffer.setRange(0, 100)
+        self.sf_min_buffer.setValue(3)
+        basic_layout.addRow("best-n: min_buffer", self.sf_min_buffer)
+        self._sf_lbl_min_buffer = basic_layout.labelForField(self.sf_min_buffer)
+
+        self.sf_batch_size = NoWheelSpinBox()
+        self.sf_batch_size.setRange(1, 200)
+        self.sf_batch_size.setValue(5)
+        basic_layout.addRow("batched: batch_size", self.sf_batch_size)
+        self._sf_lbl_batch_size = basic_layout.labelForField(self.sf_batch_size)
+
+        self.sf_batch_buffer = NoWheelSpinBox()
+        self.sf_batch_buffer.setRange(0, 100)
+        self.sf_batch_buffer.setValue(2)
+        basic_layout.addRow("batched: batch_buffer", self.sf_batch_buffer)
+        self._sf_lbl_batch_buffer = basic_layout.labelForField(self.sf_batch_buffer)
+
+        self.sf_outlier_window = NoWheelSpinBox()
+        self.sf_outlier_window.setRange(1, 500)
+        self.sf_outlier_window.setValue(15)
+        basic_layout.addRow("outlier: window_size", self.sf_outlier_window)
+        self._sf_lbl_outlier_window = basic_layout.labelForField(self.sf_outlier_window)
+
+        self.sf_outlier_sens = NoWheelSpinBox()
+        self.sf_outlier_sens.setRange(0, 100)
+        self.sf_outlier_sens.setValue(50)
+        basic_layout.addRow("outlier: sensitivity", self.sf_outlier_sens)
+        self._sf_lbl_outlier_sens = basic_layout.labelForField(self.sf_outlier_sens)
+
+        self.sf_method.currentTextChanged.connect(self._sync_sf_method_fields)
+        self._sync_sf_method_fields(self.sf_method.currentText())
+
         # COLMAP
         self.colmap_matcher = NoWheelComboBox()
         self.colmap_matcher.addItems(["exhaustive", "sequential"])
+        self.colmap_matcher.setCurrentIndex(0)
         basic_layout.addRow("COLMAP matcher", self.colmap_matcher)
 
         self.colmap_gpu = QtWidgets.QCheckBox("Use GPU if available")
@@ -219,7 +261,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.colmap_max_img = NoWheelSpinBox()
         self.colmap_max_img.setRange(800, 10000)
-        self.colmap_max_img.setValue(3200)
+        self.colmap_max_img.setValue(10000)
         basic_layout.addRow("COLMAP max image size", self.colmap_max_img)
 
         # LichtFeld
@@ -235,6 +277,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.lfs_strategy = NoWheelComboBox()
         self.lfs_strategy.addItems(["adc", "mcmc"])
+        self.lfs_strategy.setCurrentIndex(1)
         basic_layout.addRow("Strategy", self.lfs_strategy)
 
         # Advanced
@@ -242,43 +285,24 @@ class MainWindow(QtWidgets.QMainWindow):
         adv_box.setCheckable(True)
         adv_box.setChecked(False)
         form_col.addWidget(adv_box)
-        adv_layout = QtWidgets.QFormLayout(adv_box)
-        adv_layout.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
-        adv_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        adv_outer = QtWidgets.QVBoxLayout(adv_box)
+        #adv_layout = QtWidgets.QFormLayout(adv_box)
+        #adv_layout.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+        #adv_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+
+        sf_adv = self._make_subsection(adv_outer, "SharpFrames")
+        colmap_adv = self._make_subsection(adv_outer, "COLMAP")
+        lf_adv = self._make_subsection(adv_outer, "LichtFeld")
+        other_adv = self._make_subsection(adv_outer, "Other")
 
         self.sf_width = NoWheelSpinBox()
         self.sf_width.setRange(0, 8000)
         self.sf_width.setValue(0)
-        adv_layout.addRow("Frame resize width (0 = keep)", self.sf_width)
+        sf_adv.addRow("Frame resize width (0 = keep)", self.sf_width)
 
         self.sf_format = NoWheelComboBox()
         self.sf_format.addItems(["jpg", "png"])
-        adv_layout.addRow("Frame format", self.sf_format)
-
-        self.sf_min_buffer = NoWheelSpinBox()
-        self.sf_min_buffer.setRange(0, 100)
-        self.sf_min_buffer.setValue(3)
-        adv_layout.addRow("best-n: min_buffer", self.sf_min_buffer)
-
-        self.sf_batch_size = NoWheelSpinBox()
-        self.sf_batch_size.setRange(1, 200)
-        self.sf_batch_size.setValue(5)
-        adv_layout.addRow("batched: batch_size", self.sf_batch_size)
-
-        self.sf_batch_buffer = NoWheelSpinBox()
-        self.sf_batch_buffer.setRange(0, 100)
-        self.sf_batch_buffer.setValue(2)
-        adv_layout.addRow("batched: batch_buffer", self.sf_batch_buffer)
-
-        self.sf_outlier_window = NoWheelSpinBox()
-        self.sf_outlier_window.setRange(1, 500)
-        self.sf_outlier_window.setValue(15)
-        adv_layout.addRow("outlier: window_size", self.sf_outlier_window)
-
-        self.sf_outlier_sens = NoWheelSpinBox()
-        self.sf_outlier_sens.setRange(0, 100)
-        self.sf_outlier_sens.setValue(50)
-        adv_layout.addRow("outlier: sensitivity", self.sf_outlier_sens)
+        sf_adv.addRow("Frame format", self.sf_format)
 
         self.colmap_camera_model = NoWheelComboBox()
         self.colmap_camera_model.addItems(
@@ -296,56 +320,58 @@ class MainWindow(QtWidgets.QMainWindow):
                 "THIN_PRISM_FISHEYE",
             ]
         )
-        self.colmap_camera_model.setCurrentText("PINHOLE")
-        adv_layout.addRow("COLMAP camera model", self.colmap_camera_model)
+        self.colmap_camera_model.setCurrentText("SIMPLE_PINHOLE")
+        colmap_adv.addRow("Camera model", self.colmap_camera_model)
 
         self.colmap_single_cam = QtWidgets.QCheckBox("Treat as single camera")
         self.colmap_single_cam.setChecked(True)
-        adv_layout.addRow("COLMAP single camera", self.colmap_single_cam)
+        colmap_adv.addRow("Single camera", self.colmap_single_cam)
 
         self.colmap_sift_features = NoWheelSpinBox()
         self.colmap_sift_features.setRange(1024, 50000)
         self.colmap_sift_features.setValue(8192)
-        adv_layout.addRow("COLMAP max SIFT features", self.colmap_sift_features)
+        colmap_adv.addRow("Max SIFT features", self.colmap_sift_features)
 
         self.colmap_seq_overlap = NoWheelSpinBox()
         self.colmap_seq_overlap.setRange(1, 50)
         self.colmap_seq_overlap.setValue(10)
-        adv_layout.addRow("COLMAP sequential overlap", self.colmap_seq_overlap)
+        colmap_adv.addRow("Sequential overlap", self.colmap_seq_overlap)
 
         self.lfs_resize = NoWheelComboBox()
         self.lfs_resize.addItems(["auto", "1", "2", "4", "8"])
         self.lfs_resize.setCurrentText("auto")
-        adv_layout.addRow("LichtFeld resize_factor", self.lfs_resize)
+        lf_adv.addRow("Resize factor", self.lfs_resize)
 
         self.lfs_eval = QtWidgets.QCheckBox("Run evaluation during training")
         self.lfs_eval.setChecked(False)
-        adv_layout.addRow("LichtFeld eval", self.lfs_eval)
+        lf_adv.addRow("Eval", self.lfs_eval)
 
         self.lfs_gut = QtWidgets.QCheckBox("Enable GUT")
         self.lfs_gut.setChecked(False)
-        adv_layout.addRow("LichtFeld GUT", self.lfs_gut)
+        lf_adv.addRow("GUT", self.lfs_gut)
 
         self.lfs_ppisp = QtWidgets.QCheckBox("Enable PPISP")
         self.lfs_ppisp.setChecked(False)
-        adv_layout.addRow("LichtFeld PPISP", self.lfs_ppisp)
+        lf_adv.addRow("PPISP", self.lfs_ppisp)
 
         self.lfs_mip = QtWidgets.QCheckBox("Enable MIP filtering")
         self.lfs_mip.setChecked(False)
-        adv_layout.addRow("LichtFeld MIP", self.lfs_mip)
+        lf_adv.addRow("MIP filtering", self.lfs_mip)
 
         self.lfs_save_eval = QtWidgets.QCheckBox("Save evaluation images")
         self.lfs_save_eval.setChecked(False)
-        adv_layout.addRow("LichtFeld save eval images", self.lfs_save_eval)
+        lf_adv.addRow("Save eval images", self.lfs_save_eval)
 
         self.lfs_test_every = NoWheelSpinBox()
         self.lfs_test_every.setRange(1, 1000)
         self.lfs_test_every.setValue(8)
-        adv_layout.addRow("LichtFeld test_every", self.lfs_test_every)
+        lf_adv.addRow("Test every", self.lfs_test_every)
 
         self.keep_intermediates = QtWidgets.QCheckBox("Keep intermediate files")
         self.keep_intermediates.setChecked(True)
-        adv_layout.addRow("Workspace", self.keep_intermediates)
+        other_adv.addRow("Workspace", self.keep_intermediates)
+
+        adv_outer.addStretch(1)
 
         # Actions
         btn_row = QtWidgets.QHBoxLayout()
@@ -367,6 +393,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_defaults()
         self._load_settings()
 
+    def _make_subsection(self, adv_outer: QVBoxLayout, title: str) -> QtWidgets.QFormLayout:
+        box = QtWidgets.QGroupBox(title)
+        adv_outer.addWidget(box)
+        lay = QtWidgets.QFormLayout(box)
+        lay.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+        lay.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        return lay
 
     def _load_settings(self) -> None:
         s = self.settings_store.load()
@@ -386,9 +419,99 @@ class MainWindow(QtWidgets.QMainWindow):
         t = self.input_type.currentText()
         if t == "video":
             self.sf_enabled.setChecked(True)
-            self.colmap_matcher.setCurrentText("sequential")
+            self._apply_video_fps_from_input()
         else:
-            self.colmap_matcher.setCurrentText("exhaustive")
+            self.sf_enabled.setChecked(False)
+
+    def _set_row_visible(self, field: QtWidgets.QWidget, label: QtWidgets.QWidget | None, visible: bool) -> None:
+        field.setVisible(visible)
+        if label is not None:
+            label.setVisible(visible)
+
+    def _first_video_in_path(self, p: Path) -> Path | None:
+        if p.is_file():
+            return p
+        if p.is_dir():
+            vids = [x for x in sorted(p.iterdir()) if x.is_file() and x.suffix.lower() in VIDEO_EXTS]
+            return vids[0] if vids else None
+        return None
+
+    def _probe_fps_ffprobe(self, video: Path) -> float | None:
+        if shutil.which("ffprobe") is None:
+            return None
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video),
+        ]
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=10).strip()
+        except Exception:
+            return None
+        if not out or out == "0/0":
+            return None
+        try:
+            fps = float(Fraction(out)) if "/" in out else float(out)
+        except Exception:
+            return None
+        return fps if fps > 0 else None
+
+    def _probe_fps_cv2(self, video: Path) -> float | None:
+        try:
+            import cv2  # type: ignore
+        except Exception:
+            return None
+        cap = cv2.VideoCapture(str(video))
+        try:
+            if not cap.isOpened():
+                return None
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            return fps if fps > 0 else None
+        finally:
+            cap.release()
+
+    def _infer_video_fps(self, video: Path) -> float | None:
+        return self._probe_fps_ffprobe(video) or self._probe_fps_cv2(video)
+
+    def _apply_video_fps_from_input(self) -> None:
+        if self.input_type.currentText() != "video":
+            return
+        raw = self.input_path.text().strip()
+        if not raw:
+            return
+        p = Path(raw)
+        if not p.exists():
+            return
+        video = self._first_video_in_path(p)
+        if not video:
+            return
+        fps = self._infer_video_fps(video)
+        if not fps:
+            return
+        fps_i = max(1, int(round(fps)))
+        self.sf_fps.setRange(1, fps_i)
+        self.sf_fps.setValue(fps_i)
+
+    def _sync_sf_method_fields(self, method: str) -> None:
+        show_best = method == "best-n"
+        show_batched = method == "batched"
+        show_outlier = method == "outlier-removal"
+
+        self._set_row_visible(self.sf_num_frames, self._sf_lbl_num_frames, show_best)
+        self._set_row_visible(self.sf_min_buffer, self._sf_lbl_min_buffer, show_best)
+        
+        self._set_row_visible(self.sf_batch_size, self._sf_lbl_batch_size, show_batched)
+        self._set_row_visible(self.sf_batch_buffer, self._sf_lbl_batch_buffer, show_batched)
+
+        self._set_row_visible(self.sf_outlier_window, self._sf_lbl_outlier_window, show_outlier)
+        self._set_row_visible(self.sf_outlier_sens, self._sf_lbl_outlier_sens, show_outlier)
 
     def _browse_input(self) -> None:
         t = self.input_type.currentText()
