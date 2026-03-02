@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sys
+import time
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 import shutil
 import subprocess
@@ -371,6 +373,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.keep_intermediates.setChecked(True)
         other_adv.addRow("Workspace", self.keep_intermediates)
 
+        self.export_run_log = QtWidgets.QCheckBox("Export run log to output folder")
+        self.export_run_log.setChecked(True)
+        other_adv.addRow("Logs", self.export_run_log)
+
+
         adv_outer.addStretch(1)
 
         # Actions
@@ -388,6 +395,11 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_row.addStretch(1)
 
         self._last_output: Path | None = None
+        self._last_cfg: PipelineConfig | None  = None
+        self._run_t0: float | None = None
+        self.stage_name: str | None = None
+        self._stage_t0: float | None = None
+        self._stage_durations: dict[str, float] = {} 
 
         self.input_type.currentTextChanged.connect(self._sync_defaults)
         self._sync_defaults()
@@ -599,11 +611,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def _start(self) -> None:
         self.open_btn.setEnabled(False)
         self._last_output = None
+        self._last_cfg = None
 
         self._save_settings()
         cfg = self._build_config()
         self.log.clear()
         self._append("Starting…")
+
+        self._last_cfg = cfg
+        self._run_t0 = time.perf_counter()
+        self._stage_name = None
+        self._stage_t0 = None
+        self._stage_durations = {}
 
         thread = QtCore.QThread(self)
         worker = PipelineWorker(cfg)
@@ -611,7 +630,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         thread.started.connect(worker.run)
         worker.log_line.connect(self._append)
-        worker.stage.connect(lambda s: self._append(f"\n## {s}"))
+        worker.stage.connect(self._on_stage)
         worker.finished.connect(self._on_finished)
         worker.failed.connect(self._on_failed)
 
@@ -627,6 +646,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_finished(self, result: object) -> None:
         self.start_btn.setEnabled(True)
+        self._finalize_stage_timing()
+        total = 0.0
+        if self._run_t0 is not None:
+            total = time.perf_counter() - self._run_t0
         try:
             out = getattr(result, "output_dir", None)
             if out:
@@ -634,14 +657,90 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.open_btn.setEnabled(True)
         finally:
             self._append("\nFinished.")
+            self._append_timing_summary(total)
+            self._export_run_log(self._last_output)
 
     def _on_failed(self, message: str) -> None:
         self.start_btn.setEnabled(True)
         QtWidgets.QMessageBox.critical(self, "Pipeline failed", message)
         self._append("\nFAILED: " + message)
+        self._finalize_stage_timing()
+        total = 0.0
+        if self._run_t0 is not None:
+            total = time.perf_counter() - self._run_t0
+        self._append_timing_summary(total)
+        self._export_run_log(self._last_output)
 
     def _append(self, line: str) -> None:
         self.log.appendPlainText(line)
+
+    def _on_stage(self, stage: str) -> None:
+        now = time.perf_counter()
+        if self._stage_name is not None and self._stage_t0 is not None:
+            self._stage_durations[self._stage_name] = self._stage_durations.get(self._stage_name, 0.0) + (now - self._stage_t0)
+        self._stage_name = stage
+        self._stage_t0 = now
+        self._append(f"\n## {stage}")
+
+    def _finalize_stage_timing(self) -> None:
+        now = time.perf_counter()
+        if self._stage_name is not None and self._stage_t0 is not None:
+            self._stage_durations[self._stage_name] = self._stage_durations.get(self._stage_name, 0.0) + (now - self._stage_t0)
+        self._stage_name = None
+        self._stage_t0 = None
+
+    @staticmethod
+    def _fmt_secs(sec: float) -> str:
+        sec = max(0.0, float(sec))
+        total_ms = int(sec * 1000.0)
+        s, ms = divmod(total_ms, 1000)
+        m, s = divmod(s, 60)
+        h, m = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+    def _append_timing_summary(self, total_sec: float) -> None:
+        def _sum_if(pred) -> float:
+            return sum(v for k, v in self._stage_durations.items() if pred(k.lower()))
+
+        sharp_sec = _sum_if(lambda n: "sharp" in n)
+        colmap_sec = _sum_if(lambda n: "colmap" in n)
+        licht_sec = _sum_if(lambda n: ("licht" in n) or ("train" in n))
+
+        # Fallback: if we never emit a Sharp Frames stage, treat Ingest as Sharp Frames only when sampling is enabled.
+        if sharp_sec <= 0.0 and self._last_cfg is not None and self._last_cfg.frame_sampling.enabled:
+            sharp_sec = _sum_if(lambda n: "ingest" in n)
+
+        self._append("\n## Timing")
+        self._append(f"Sharp Frames: {self._fmt_secs(sharp_sec)}")
+        self._append(f"COLMAP:      {self._fmt_secs(colmap_sec)}")
+        self._append(f"LichtFeld:   {self._fmt_secs(licht_sec)}")
+        self._append(f"Total:       {self._fmt_secs(total_sec)}")
+
+    def _export_run_log(self, out_dir: Path | None) -> None:
+        if not getattr(self, "export_run_log", None) or not self.export_run_log.isChecked():
+            return
+
+        text = self.log.toPlainText()
+        if not text.strip():
+            return
+
+        target: Path | None = None
+        if out_dir and out_dir.exists():
+            target = out_dir
+        else:
+            base = Path(self.output_dir.text().strip()) if hasattr(self, "output_dir") else None
+            if base and base.exists() and base.is_dir():
+                target = base
+
+        if target is None:
+            return
+
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = "splatflow.log" if out_dir and out_dir.exists() else f"splatflow-{ts}.log"
+        try:
+            (target / name).write_text(text, encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
     def _open_output(self) -> None:
         if not self._last_output:
