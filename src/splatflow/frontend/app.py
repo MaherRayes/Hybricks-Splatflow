@@ -344,10 +344,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lfs_resize.setCurrentText("auto")
         lf_adv.addRow("Resize factor", self.lfs_resize)
 
-        self.lfs_eval = QtWidgets.QCheckBox("Run evaluation during training")
-        self.lfs_eval.setChecked(False)
-        lf_adv.addRow("Eval", self.lfs_eval)
-
         self.lfs_gut = QtWidgets.QCheckBox("Enable GUT")
         self.lfs_gut.setChecked(False)
         lf_adv.addRow("GUT", self.lfs_gut)
@@ -360,14 +356,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lfs_mip.setChecked(False)
         lf_adv.addRow("MIP filtering", self.lfs_mip)
 
+        self.lfs_eval = QtWidgets.QCheckBox("Run evaluation during training")
+        self.lfs_eval.setChecked(True)
+        lf_adv.addRow("Eval", self.lfs_eval)
+
         self.lfs_save_eval = QtWidgets.QCheckBox("Save evaluation images")
-        self.lfs_save_eval.setChecked(False)
+        self.lfs_save_eval.setChecked(True)
         lf_adv.addRow("Save eval images", self.lfs_save_eval)
 
         self.lfs_test_every = NoWheelSpinBox()
         self.lfs_test_every.setRange(1, 1000)
         self.lfs_test_every.setValue(8)
-        lf_adv.addRow("Test every", self.lfs_test_every)
+        lf_adv.addRow("Test every N-th image", self.lfs_test_every)
 
         self.keep_intermediates = QtWidgets.QCheckBox("Keep intermediate files")
         self.keep_intermediates.setChecked(True)
