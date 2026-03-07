@@ -1,6 +1,13 @@
 # Virtual env
 .venv/
+.venv-build/
 
 # Python cache
 __pycache__/
 *.py[cod]
+
+#Packaging and wrapping
+dist/
+installer/
+build/
+*.spec

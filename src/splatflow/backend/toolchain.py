@@ -249,14 +249,30 @@ class Toolchain:
     # -------------------------
     # Sharp Frames
     # -------------------------
+    def _ffmpeg_env(self) -> dict[str, str]:
+        if not self.settings.auto_install_tools:
+            return {}
+        try:
+            env_prefix = self.ensure_env("video-tools", ["ffmpeg"])
+        except Exception:
+            return {}
+        return self._with_path({}, self._env_bin_dirs(env_prefix))
+
     def sharp_frames_exe(self) -> ToolExec:
+        env = self._ffmpeg_env()
+
+        if getattr(sys, "frozen", False):
+            app_dir = Path(sys.executable).resolve().parent
+            helper = app_dir / ("sharp-frames-helper.exe" if os.name == "nt" else "sharp-frames-helper")
+            if helper.exists():
+                return ToolExec(exe=helper, prefix=[str(helper)], env=env)
+
         found = self.runner.which("sharp-frames")
         if found:
-            return ToolExec(exe=Path(found), prefix=[found], env={})
+            return ToolExec(exe=Path(found), prefix=[found], env=env)
 
-        # fall back to `python -m sharp_frames`
         prefix = [sys.executable, "-m", "sharp_frames"]
-        return ToolExec(exe=Path(sys.executable), prefix=prefix, env={})
+        return ToolExec(exe=Path(sys.executable), prefix=prefix, env=env)
 
     # -------------------------
     # LichtFeld Studio
